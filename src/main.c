@@ -104,7 +104,8 @@ static void apply_title_defaults(void)
     /* The F6 menu: only what applies to this title, in its colour. */
     set_default_env("RECOMP_MENU_HIDE", "move,camera,showfps,reload");
     set_default_env("RECOMP_MENU_THEME", "red");
-    set_default_env("RN_WIRE_LOG", "1");      /* until the missing razor wire is understood */
+    /* The wire is understood now (see docs/mesh-format.md); logging is opt-in:
+     * RN_WIRE_LOG for the counters, RN_WIRE_SHOTS for frame captures. */
     /* DirectSound is the XDK's own and probes the AC'97 codec. */
     set_default_env("RECOMP_AC97_READY", "1");
     set_default_env("RECOMP_TEX_BILINEAR", "1");
@@ -1348,10 +1349,25 @@ static DWORD WINAPI rn_debug_thread(LPVOID unused)
 extern int xbox_GfxFps60(void);
 static void rn_fps_apply(void)
 {
+    extern int xbox_MoviePlaying(void);
     static float base_step, base_fps;
+    static int said_movie;
     uint8_t *mem = (uint8_t *)g_xbox_mem_offset;
     float step, fps, want_step, want_fps;
     int on = xbox_GfxFps60();
+    /* Not during a movie. The .xmv decoder runs at the file's own rate, so at
+     * 60 the extra flips present a buffer it has not drawn into and the
+     * picture alternates between two frames. The game goes back to its own
+     * rate while one plays and returns to 60 when it ends. */
+    if (on && xbox_MoviePlaying()) {
+        on = 0;
+        if (!said_movie) {
+            said_movie = 1;
+            fprintf(stderr, "[RN] movie playing: back to the game's own frame rate\n");
+        }
+    } else if (!xbox_MoviePlaying()) {
+        said_movie = 0;
+    }
     if (!mem) return;
     memcpy(&step, mem + 0x2EEC50u, 4);
     memcpy(&fps, mem + 0x69AFACu, 4);

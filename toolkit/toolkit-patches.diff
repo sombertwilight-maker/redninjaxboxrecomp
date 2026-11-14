@@ -902,8 +902,63 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +}
 diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x output /home/claude/rn/xboxrecomp-0.17.0/src/kernel/kernel_file.c ./src/kernel/kernel_file.c
 --- /home/claude/rn/xboxrecomp-0.17.0/src/kernel/kernel_file.c	2026-11-06 02:27:36.000000000 -0500
-+++ ./src/kernel/kernel_file.c	2026-11-13 16:23:09.632697126 -0500
-@@ -396,6 +396,16 @@
++++ ./src/kernel/kernel_file.c	2026-11-14 14:51:26.122025905 -0500
+@@ -242,6 +242,49 @@
+     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+ }
+ 
++/* Video playback, for a title whose frame rate has been changed.
++ *
++ * An Xbox title plays its movies from .xmv files, and the decoder runs at the
++ * file's own rate. A port that doubles the game's frame rate leaves the movie
++ * where it was, so the extra flips present a buffer the decoder has not
++ * written into and the picture alternates between two frames -- Red Ninja's
++ * intro flickers exactly this way at 60. Knowing a movie file is open is
++ * enough for the title's side to put the rate back while one plays.
++ *
++ * Counted rather than a flag: a title may open the next movie before closing
++ * the last. */
++static volatile LONG s_movie_open;
++static HANDLE s_movie_handles[16];
++
++static int path_is_movie(const WCHAR *p)
++{
++    size_t n = p ? wcslen(p) : 0;
++    return n > 4 && (p[n - 4] == L'.')
++        && (p[n - 3] == L'x' || p[n - 3] == L'X')
++        && (p[n - 2] == L'm' || p[n - 2] == L'M')
++        && (p[n - 1] == L'v' || p[n - 1] == L'V');
++}
++
++static void movie_opened(HANDLE h)
++{
++    int i;
++    for (i = 0; i < 16; i++)
++        if (!s_movie_handles[i]) { s_movie_handles[i] = h; InterlockedIncrement(&s_movie_open); return; }
++}
++
++static void movie_closed(HANDLE h)
++{
++    int i;
++    for (i = 0; i < 16; i++)
++        if (s_movie_handles[i] == h) { s_movie_handles[i] = NULL; InterlockedDecrement(&s_movie_open); return; }
++}
++
++/* Non-zero while the title holds a video file open. */
++int xbox_MoviePlaying(void)
++{
++    return s_movie_open > 0;
++}
++
+ /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
+ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+                                WCHAR* win_path, DWORD buf_size)
+@@ -393,9 +436,21 @@
+         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
+     }
+     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %S -> handle=%p", win_path, h);
++    if (path_is_movie(win_path))
++        movie_opened(h);
      return STATUS_SUCCESS;
  }
  
@@ -920,7 +975,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  NTSTATUS __stdcall xbox_NtReadFile(
      HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
      PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
-@@ -410,6 +420,15 @@
+@@ -410,6 +465,15 @@
          return STATUS_INVALID_PARAMETER;
  
      overwrite_settle(FileHandle);
@@ -936,6 +991,14 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      if (ByteOffset && ByteOffset->QuadPart >= 0) {
          memset(&ov, 0, sizeof(ov));
          ov.Offset = ByteOffset->LowPart;
+@@ -479,6 +543,7 @@
+     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+         overwrite_settle(Handle);
++        movie_closed(Handle);
+         xbox_dir_context_drop(Handle);
+         CloseHandle(Handle);
+         return STATUS_SUCCESS;
 diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x output /home/claude/rn/xboxrecomp-0.17.0/src/kernel/kernel_xbox.c ./src/kernel/kernel_xbox.c
 --- /home/claude/rn/xboxrecomp-0.17.0/src/kernel/kernel_xbox.c	2026-11-06 02:27:36.000000000 -0500
 +++ ./src/kernel/kernel_xbox.c	2026-11-13 06:57:43.793672576 -0500
@@ -1094,7 +1157,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  #endif /* NV2A_BACKEND_H */
 diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x output /home/claude/rn/xboxrecomp-0.17.0/src/kernel/nv2a_d3d11.c ./src/kernel/nv2a_d3d11.c
 --- /home/claude/rn/xboxrecomp-0.17.0/src/kernel/nv2a_d3d11.c	2026-11-09 19:58:07.000000000 -0500
-+++ ./src/kernel/nv2a_d3d11.c	2026-11-14 14:09:29.121356413 -0500
++++ ./src/kernel/nv2a_d3d11.c	2026-11-14 14:36:29.193835709 -0500
 @@ -35,6 +35,7 @@
  #include <stdarg.h>
  #include <stdint.h>
@@ -1683,7 +1746,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      k_view(&vp, &sc);
      memset(s_vcb_data, 0, sizeof s_vcb_data);
      s_vcb_data[0] = 2.0f / (float)rt->w;
-@@ -1312,6 +1647,129 @@
+@@ -1312,6 +1647,143 @@
  
  /* ---- the back end ------------------------------------------------------- */
  
@@ -1704,14 +1767,14 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +                            const uint32_t *idx, uint32_t nidx);
 +#define ECHO_VERTS 64
 +static struct {
-+    int off, held;
++    int off, held, depth;
 +    Nv2aGpuState st;
 +    Nv2aGpuVsh vs;
 +    uint32_t prog[136][4];
 +    float consts[192][4];
 +    float in[ECHO_VERTS * 64];
 +    uint32_t idx[ECHO_VERTS * 6], nverts, nidx;
-+} s_echo = { -1 };
++} s_echo = { -1, 0, -1 };
 +
 +static void echo_flush(void)
 +{
@@ -1780,7 +1843,21 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +    }
 +    if (!s_echo.off)
 +        return 0;
-+    if (rs->depth_test_enable || !rs->blend_enable || rs->blend_src != 0x302 || rs->blend_dst != 0x303
++    /* RECOMP_GPU_ECHO_DEPTH: also collapse copies that test depth.
++     *
++     * The echo filter was written for sprites, which do not. Red Ninja's
++     * title screen draws its trail as depth-tested 3D instead: fifteen copies
++     * of one mesh, identical vertex data, receding into the distance, told
++     * apart only by the matrices in each copy's fixup. Nothing in the batches
++     * distinguishes that from a row of identical crates, which is why this is
++     * off unless asked for -- a title that draws repeated scenery this way
++     * would lose all but the last of it. */
++    if (s_echo.depth < 0) {
++        const char *e = getenv("RECOMP_GPU_ECHO_DEPTH");
++        s_echo.depth = e && *e && *e != '0';
++    }
++    if ((rs->depth_test_enable && !s_echo.depth)
++            || !rs->blend_enable || rs->blend_src != 0x302 || rs->blend_dst != 0x303
 +            || !st->tex[0].valid || nverts > ECHO_VERTS || vs->stride > 64 || nidx > ECHO_VERTS * 6
 +            || vs->nins > 136 || !nverts) {
 +        echo_flush();
@@ -1813,7 +1890,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  static void d3d_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t argb,
                        uint32_t zs, const uint32_t rect[4])
  {
-@@ -1319,10 +1777,15 @@
+@@ -1319,10 +1791,15 @@
      float k[8];
      D3D11_DEPTH_STENCIL_DESC dd;
      UINT8 mask = 0;
@@ -1829,7 +1906,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      S.clears++;
      if (flags & 0x10) mask |= D3D11_COLOR_WRITE_ENABLE_BLUE;
      if (flags & 0x20) mask |= D3D11_COLOR_WRITE_ENABLE_GREEN;
-@@ -1356,6 +1819,7 @@
+@@ -1356,6 +1833,7 @@
      ID3D11DeviceContext_OMSetBlendState(C, get_bs(0, 1, 0, 0x8006, mask), NULL, 0xFFFFFFFF);
      ID3D11DeviceContext_IASetInputLayout(C, NULL);
      ID3D11DeviceContext_IASetPrimitiveTopology(C, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1837,7 +1914,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      ID3D11DeviceContext_VSSetShader(C, s_clear_vs, NULL, 0);
      ID3D11DeviceContext_PSSetShader(C, s_clear_ps, NULL, 0);
      ID3D11DeviceContext_PSSetConstantBuffers(C, 0, 1, &s_ccb);
-@@ -1379,10 +1843,29 @@
+@@ -1379,10 +1857,29 @@
   *   skip LO HI   -- draws LO..HI-1 of each frame are not drawn
   *   only LO HI   -- only draws LO..HI-1 are drawn
   *   log          -- the next frame's draws are listed on stderr
@@ -1868,7 +1945,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  static void dbg_poll(void)
  {
      WIN32_FILE_ATTRIBUTE_DATA fa;
-@@ -1403,13 +1886,15 @@
+@@ -1403,13 +1900,15 @@
      s_dbg.ft = fa.ftLastWriteTime;
      f = fopen("gpudbg.txt", "r");
      if (!f) return;
@@ -1885,7 +1962,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      }
      fclose(f);
      fprintf(stderr, "[GPU-DBG] frame %u mode %d %u..%u log %d flags %X\n", s_frame, s_dbg.mode, s_dbg.lo, s_dbg.hi, s_dbg.log, s_dbg.flags);
-@@ -1454,6 +1939,7 @@
+@@ -1454,6 +1953,7 @@
  static int setup_pixels(const Nv2aGpuState *st)
  {
      const Nv2aRenderState *rs = &st->rs;
@@ -1893,7 +1970,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      uint32_t rect[4];
      DsEnt *ds = NULL;
      PsKey key;
-@@ -1468,6 +1954,56 @@
+@@ -1468,6 +1968,56 @@
  
      if (s_dbg.mode == 1 && dix >= s_dbg.lo && dix < s_dbg.hi) return 0;
      if (s_dbg.mode == 2 && (dix < s_dbg.lo || dix >= s_dbg.hi)) return 0;
@@ -1950,7 +2027,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      rect[0] = st->clip_x; rect[1] = st->clip_y;
      rect[2] = st->clip_x + st->clip_w; rect[3] = st->clip_y + st->clip_h;
      if (st->swizzled) {
-@@ -1518,10 +2054,27 @@
+@@ -1518,10 +2068,27 @@
          if (!(mode == 1 || mode == 2 || mode == 3) || !t->valid)
              continue;
          linear = st->bilinear || mag == 2 || min == 2 || min == 4 || min == 6;
@@ -1978,7 +2055,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
              srv[i] = rt->srv;
              key.kind[i] = 1;
              key.swap_rb[i] = (t->color == 0x3A || t->color == 0x3F);
-@@ -1633,14 +2186,62 @@
+@@ -1633,14 +2200,62 @@
      return 1;
  }
  
@@ -2042,7 +2119,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      if (K.vs != s_vs) { ID3D11DeviceContext_VSSetShader(C, s_vs, NULL, 0); K.vs = s_vs; }
      if (K.cb_vsh != 1) { ID3D11DeviceContext_VSSetConstantBuffers(C, 0, 1, &s_vcb); K.cb_vsh = 1; }
      K.vb = NULL;                       /* rebound below each chunk */
-@@ -1655,6 +2256,12 @@
+@@ -1655,6 +2270,12 @@
          if (FAILED(ID3D11DeviceContext_Map(C, (ID3D11Resource *)s_vb, 0, how, 0, &m)))
              return;
          memcpy((Nv2aGpuVertex *)m.pData + s_vb_pos, v + done, (size_t)n * sizeof *v);
@@ -2055,7 +2132,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          ID3D11DeviceContext_Unmap(C, (ID3D11Resource *)s_vb, 0);
          ID3D11DeviceContext_IASetVertexBuffers(C, 0, 1, &s_vb, &stride, &off);
          ID3D11DeviceContext_Draw(C, n, s_vb_pos);
-@@ -1825,6 +2432,7 @@
+@@ -1825,6 +2446,7 @@
           "  VO o;\n"
           "  float4 P = R12;\n"
           "  if (P.w == 0 && asuint(P.w) == 0) P.w = 1;\n"
@@ -2063,7 +2140,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
           "  float wv = P.w;\n"
           "  o.p = float4((P.x * vp.x - 1.0) * wv, (1.0 - P.y * vp.y) * wv, P.z * vp.z * wv, wv);\n"
           "  o.d0 = saturate(O3); o.d1 = saturate(O4);\n"
-@@ -1927,9 +2535,9 @@
+@@ -1927,9 +2549,9 @@
      return (long)at;
  }
  
@@ -2076,7 +2153,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  {
      VsEnt *e;
      long vo, io;
-@@ -1942,6 +2550,34 @@
+@@ -1942,6 +2564,34 @@
          return 0;
      if (!setup_pixels(st))
          return 1;                     /* nothing the CPU could do better */
@@ -2111,7 +2188,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      /* Constants: re-uploaded only when they changed. */
      if (!s_kcb_valid || memcmp(s_kcb_data, vs->consts, sizeof s_kcb_data)) {
          memcpy(s_kcb_data, vs->consts, sizeof s_kcb_data);
-@@ -1949,9 +2585,17 @@
+@@ -1949,9 +2599,17 @@
          s_kcb_valid = 1;
          S.const_uploads++;
      }
@@ -2130,7 +2207,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      s_vcb_data[9] = (float)vs->fog_mode;
      s_vcb_data[10] = vs->fog_param[0];
      s_vcb_data[11] = vs->fog_param[1];
-@@ -1962,7 +2606,16 @@
+@@ -1962,7 +2620,16 @@
      if (vo < 0 || io < 0)
          return 0;
      if (K.il != e->il) { ID3D11DeviceContext_IASetInputLayout(C, e->il); K.il = e->il; }
@@ -2148,7 +2225,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      if (stride && (K.vb != s_vb2 || K.vstride != stride)) {
          ID3D11DeviceContext_IASetVertexBuffers(C, 0, 1, &s_vb2, &stride, &zero);
          K.vb = s_vb2; K.vstride = stride;
-@@ -2002,9 +2655,7 @@
+@@ -2002,9 +2669,7 @@
      "  p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); t = q * uv.xy; }\n"
      "float4 ps(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target { return T.Sample(S, t); }\n";
  
@@ -2158,7 +2235,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  static ID3D11SamplerState *s_blit_lin, *s_blit_pt;
  static ID3D11BlendState *s_blit_alpha;
  static IDXGISwapChain *s_swap;
-@@ -2085,6 +2736,7 @@
+@@ -2085,6 +2750,7 @@
      ID3D11DeviceContext_UpdateSubresource(C, (ID3D11Resource *)s_blit_cb, 0, NULL, cb, 0, 0);
      ID3D11DeviceContext_IASetInputLayout(C, NULL);
      ID3D11DeviceContext_IASetPrimitiveTopology(C, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2166,7 +2243,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      ID3D11DeviceContext_VSSetShader(C, s_blit_vs, NULL, 0);
      ID3D11DeviceContext_VSSetConstantBuffers(C, 0, 1, &s_blit_cb);
      ID3D11DeviceContext_PSSetShader(C, s_blit_ps, NULL, 0);
-@@ -2095,6 +2747,115 @@
+@@ -2095,6 +2761,115 @@
      k_reset();                      /* everything above bypassed the shadow */
  }
  
@@ -2282,7 +2359,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  static void swap_release(void)
  {
      if (s_swap_rtv) { ID3D11RenderTargetView_Release(s_swap_rtv); s_swap_rtv = NULL; }
-@@ -2216,12 +2977,19 @@
+@@ -2216,12 +2991,19 @@
          return 0;
      }
      cw = (float)s_swap_w; ch = (float)s_swap_h;
@@ -2307,7 +2384,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      overlay_update();
      if (s_ovl_srv)
          blit(s_swap_rtv, s_ovl_srv, 1.0f, 1.0f, 0, 0, (float)s_ovl_w, (float)s_ovl_h,
-@@ -2241,17 +3009,16 @@
+@@ -2241,17 +3023,16 @@
      D3D11_MAPPED_SUBRESOURCE m;
      uint32_t sw = rt->w, sh = rt->h, y, x;
  
@@ -2330,7 +2407,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          src = (ID3D11Resource *)s_small.t;
      }
      if (!s_stage[cur] || s_stage_w[cur] != sw || s_stage_h[cur] != sh) {
-@@ -2301,16 +3068,21 @@
+@@ -2301,16 +3082,21 @@
  static void d3d_present_sync(uint32_t va, uint32_t pitch, uint32_t bpp,
                               uint32_t w, uint32_t h)
  {
@@ -2353,7 +2430,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  }
  
  /* The F6 menu's choices, taken between frames. A new internal resolution
-@@ -2321,13 +3093,25 @@
+@@ -2321,13 +3107,25 @@
      XboxGfxConfig *g = xbox_GfxConfig();
      static int reload_seen = -1;
      uint32_t want = g->scale < 1 ? 1u : (g->scale > 4 ? 4u : (uint32_t)g->scale);
@@ -2380,7 +2457,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
                  ID3D11DepthStencilView_Release(s_ds[i].dsv);
                  ID3D11Texture2D_Release(s_ds[i].t);
                  memset(&s_ds[i], 0, sizeof s_ds[i]);
-@@ -2341,10 +3125,14 @@
+@@ -2341,10 +3139,14 @@
          ID3D11DeviceContext_OMSetRenderTargets(C, 0, NULL, NULL);
          s_cur_rt = NULL;
          s_scale = want;
@@ -2397,7 +2474,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      if (reload_seen != g->reload_seq) {
          reload_seen = g->reload_seq;
          tex_cache_clear();
-@@ -2356,7 +3144,9 @@
+@@ -2356,7 +3158,9 @@
  {
      static DWORD last;
      DWORD now = GetTickCount();
@@ -2434,7 +2511,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      unsigned swap_interval;
 diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x output /home/claude/rn/xboxrecomp-0.17.0/src/kernel/nv2a_pb_exec.c ./src/kernel/nv2a_pb_exec.c
 --- /home/claude/rn/xboxrecomp-0.17.0/src/kernel/nv2a_pb_exec.c	2026-11-06 02:27:36.000000000 -0500
-+++ ./src/kernel/nv2a_pb_exec.c	2026-11-14 14:13:54.344601052 -0500
++++ ./src/kernel/nv2a_pb_exec.c	2026-11-14 14:32:18.055860145 -0500
 @@ -42,9 +42,16 @@
   * Morton order, not a second one that can disagree with it. */
  #include "../d3d/d3d8_swizzle.h"
@@ -2630,12 +2707,30 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      uint32_t w = s_gpu.texs[0].width, h = s_gpu.texs[0].height, x, y;
      uint32_t row_bytes, pad, filesz;
      uint8_t hdr[54];
-@@ -2138,6 +2246,26 @@
+@@ -2138,6 +2246,44 @@
  #define NV_PRIM_QUAD_STRIP     9
  #define NV_PRIM_POLYGON        10
  
 +/* How many batches of each primitive the title submitted, and how many line
 + * batches were lost because only the GPU path draws lines. */
++/* RECOMP_GPU_LINES / RECOMP_GPU_POINTS: whether line and point batches are
++ * drawn at all. Lines are on -- a title that draws a rope or a cable as a
++ * line strip loses it otherwise. Points are off: the hardware draws them at
++ * the size SET_POINT_SIZE asks for, and this back end can only manage one
++ * pixel, which is a worse likeness than leaving them out. */
++static int draw_lines_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("RECOMP_GPU_LINES"); on = !(e && *e == '0'); }
++    return on;
++}
++static int draw_points_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("RECOMP_GPU_POINTS"); on = e && *e && *e != '0'; }
++    return on;
++}
++
 +/* How many vertices a batch of this primitive needs before it draws
 + * anything: three for the triangle family, two for a line, one for a point.
 + * Assuming three dropped every two-vertex line batch a title submitted --
@@ -2657,7 +2752,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  /* How many post-draw captures to keep: enough to see whether the geometry
   * is stable from frame to frame, few enough not to fill a directory. */
  #define FB_DUMP_AFTER_DRAW 8
-@@ -2220,6 +2348,155 @@
+@@ -2220,6 +2366,155 @@
      note_drawn();
  }
  
@@ -2813,7 +2908,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  /* One triangle by vertex index: gather position and, if the batch has one,
   * texture coordinate 0. A vertex whose position cannot be read is not drawn;
   * a batch whose texcoords cannot be read is drawn untextured rather than not
-@@ -2243,6 +2520,33 @@
+@@ -2243,6 +2538,33 @@
              && fetch_texcoord(i1, uv[1])
              && fetch_texcoord(i2, uv[2]);
  
@@ -2847,7 +2942,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      if (backend_draws()) {                 /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          const uint32_t ix[3] = { i0, i1, i2 };
-@@ -2730,7 +3034,7 @@
+@@ -2730,7 +3052,7 @@
                              continue;
                      }
                  }
@@ -2856,7 +2951,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
                      *zp = z;
                  if (s_gpu.zpass_enable)
                      cnt->zpass++;
-@@ -3068,6 +3372,16 @@
+@@ -3068,6 +3390,16 @@
          s_gpu.xf_degenerate++;
          return;
      }
@@ -2873,7 +2968,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -3321,15 +3635,563 @@
+@@ -3321,15 +3653,567 @@
      s_xf_o[2] = of[2];
  }
  
@@ -3000,18 +3095,22 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +     * invisible while its trail mesh rendered. Two indices per line, and the
 +     * back end is told to read them that way. */
 +    case NV_PRIM_LINES:
++        if (!draw_lines_on()) return 1;
 +        for (i = 0; i + 1 < n; i += 2) LINE(i, i + 1);
 +        break;
 +    case NV_PRIM_LINE_STRIP:
++        if (!draw_lines_on()) return 1;
 +        for (i = 0; i + 1 < n; i++) LINE(i, i + 1);
 +        break;
 +    case NV_PRIM_LINE_LOOP:
++        if (!draw_lines_on()) return 1;
 +        for (i = 0; i + 1 < n; i++) LINE(i, i + 1);
 +        if (n > 2) LINE(n - 1, 0);
 +        break;
 +    /* Points. One index each; the hardware's point size is not reproduced,
 +     * so these come out a pixel wide. */
 +    case NV_PRIM_POINTS:
++        if (!draw_points_on()) return 1;
 +        for (i = 0; i < n; i++) vidx[ni++] = slot_of[i];
 +        break;
 +    default:
@@ -3440,7 +3539,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3463,6 +4325,8 @@
+@@ -3463,6 +4347,8 @@
      }
      /* The batch's triangles, all at once (see xf_queue_push). */
      xf_queue_flush();
@@ -3449,7 +3548,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      if (backend_draws())
          backend_flush(!s_xf_no_tex);
  }
-@@ -3473,7 +4337,7 @@
+@@ -3473,7 +4359,7 @@
      uint32_t before = s_gpu.tris_drawn;
      int textured = 0;
  
@@ -3458,7 +3557,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          return;
      if (batch_uses_program() || batch_is_ffp()) {
          raster_batch_program();
-@@ -3546,6 +4410,8 @@
+@@ -3546,6 +4432,8 @@
      default:
          break;                             /* points and lines: not yet */
      }
@@ -3467,7 +3566,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      if (backend_draws())
          backend_flush(textured);
  
-@@ -3615,7 +4481,7 @@
+@@ -3615,7 +4503,7 @@
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -3476,7 +3575,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
      s_gpu.verts += s_gpu.idx_count;
  
-@@ -3815,7 +4681,7 @@
+@@ -3815,7 +4703,7 @@
          goto out;
  
      count = (s_gpu.inline_count * 4) / vsize;
@@ -3485,7 +3584,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          goto out;
      for (a = 0; a < NV_VERTEX_ATTRS; a++)
          if (s_gpu.attr[a].size)
-@@ -3853,7 +4719,7 @@
+@@ -3853,7 +4741,7 @@
      VertexAttr saved[NV_VERTEX_ATTRS];
      uint32_t i;
  
@@ -3494,7 +3593,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          return;
  
      memcpy(saved, s_gpu.attr, sizeof saved);
-@@ -4074,6 +4940,7 @@
+@@ -4074,6 +4962,7 @@
  
  void nv2a_pb_exec_walk_begin(void)
  {
@@ -3502,7 +3601,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      s_walk_vbl = xbox_VblankCount();
  }
  
-@@ -4118,6 +4985,9 @@
+@@ -4118,6 +5007,9 @@
  }
  
  /* Once per pass of the ack loop: 1 while a flip is held. */
@@ -3512,7 +3611,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
  int nv2a_pb_exec_flip_poll(void)
  {
      uint64_t now;
-@@ -4173,8 +5043,246 @@
+@@ -4173,8 +5065,330 @@
      return 1;
  }
  
@@ -3539,7 +3638,6 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +static uint32_t s_run_pb;                 /* RunPushBuffer jump-backs written */
 +static uint32_t s_fixdiag_said, s_fixdiag_said2, s_fixdiag_seen[32], s_fix_vtx;
 +static uint32_t s_vtxpb[64], s_vtxpb_n;
-+static uint32_t s_fix_eager;   /* fixup blocks applied at submission */
 +static int s_fix_at_submit;    /* the title applies its own, at submission */
 +static int pb_fixdiag(void)
 +{
@@ -3547,6 +3645,39 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +    if (on < 0) { const char *e = getenv("RECOMP_PB_FIXDIAG"); on = e && *e && *e != '0'; }
 +    return on;
 +}
++
++/* Fixups captured at submission, applied at execution.
++ *
++ * Both halves matter and they want different moments. The values are only
++ * right at submission: a fixup arena is append-only and D3D recycles it every
++ * frame or two, so by the time the executor's walk reaches the record that
++ * names it, the arena may hold another frame's content -- or, for a block the
++ * engine writes exactly once, nothing at all. The moment to apply them is
++ * execution: a pushbuffer is shared mutable state, so patching it when the
++ * title submits means the title's next frame can overwrite the pose of a
++ * frame the executor has not drawn yet (fast movement tears), and a mesh
++ * submitted twice in one frame with different matrices ends up drawn twice
++ * with the second one's.
++ *
++ * So the entries are copied here when the title submits, and applied from the
++ * copy when the walk arrives -- oldest first, so repeated submissions of one
++ * pushbuffer are replayed in the order they were made. */
++/* Room for several frames of submissions: the walk can be a whole frame or
++ * more behind, and a capture dropped before it is used leaves that draw with
++ * an unpatched pushbuffer -- a character posed by whatever was in it last,
++ * which reads on screen as a flicker. */
++#define FIX_SNAP_SLOTS 4096
++#define FIX_SNAP_BYTES (8u << 20)
++#define FIX_SNAP_MAX   0x10000u         /* biggest run worth keeping */
++
++typedef struct {
++    uint32_t pbd, fix, at, bytes, used;
++} FixSnap;
++
++static FixSnap  s_fsnap[FIX_SNAP_SLOTS];
++static uint8_t *s_fsnap_buf;
++static uint32_t s_fsnap_head, s_fsnap_tail, s_fsnap_pos;
++static uint32_t s_fsnap_taken, s_fsnap_missed, s_fsnap_dropped;
 +
 +/* A D3DFixup, applied when the title submits the pushbuffer rather than when
 + * the executor's walk reaches the record.
@@ -3580,7 +3711,8 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +void xbox_Nv2aFixupVertexArrays(uint32_t pb_desc, uint32_t fixup_obj)
 +{
 +    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-+    uint32_t pbd, pb_len, base, start, used, at, guard = 0;
++    uint32_t pbd, pb_len, base, start, used, bytes;
++    FixSnap *sl;
 +
 +    if (!mem || !pb_desc || !fixup_obj)
 +        return;
@@ -3595,22 +3727,68 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +        return;
 +    if (!base || (base & 3u) || base >= 0xFD000000u || used <= start)
 +        return;
-+    /* From here the walk must not apply fixups: a second, later pass would
-+     * copy whatever the arena holds by then over the values that were right. */
++    bytes = used - start;
++    if (bytes > FIX_SNAP_MAX)
++        return;                         /* left to the walk, as before */
++    if (!s_fsnap_buf && !(s_fsnap_buf = (uint8_t *)malloc(FIX_SNAP_BYTES)))
++        return;
 +    s_fix_at_submit = 1;
-+    for (at = start; at + 8 <= used && guard++ < 4096u; ) {
-+        const uint32_t *fp = (const uint32_t *)(mem + base + at);
-+        uint32_t size = fp[0], off = fp[1];
-+        if (size == 0xFFFFFFFFu)
-+            break;
-+        if (!size || size > 0x4000u || (size & 3u) || (off & 3u)
-+                || off >= pb_len || size > pb_len - off
-+                || at + 8 + size > used)
-+            break;
-+        memcpy(mem + pbd + off, fp + 2, size);
-+        s_fix_eager++;
-+        at += 8 + size;
++
++    /* Room for one more: drop the oldest rather than the newest, so a walk
++     * that has fallen behind loses the frames it was never going to draw. */
++    while ((s_fsnap_head + 1u) % FIX_SNAP_SLOTS == s_fsnap_tail
++           || s_fsnap_pos + bytes > FIX_SNAP_BYTES) {
++        if (s_fsnap_head == s_fsnap_tail) { s_fsnap_pos = 0; break; }
++        s_fsnap_tail = (s_fsnap_tail + 1u) % FIX_SNAP_SLOTS;
++        s_fsnap_dropped++;
++        if (s_fsnap_tail == s_fsnap_head) { s_fsnap_pos = 0; break; }
 +    }
++    if (s_fsnap_pos + bytes > FIX_SNAP_BYTES)
++        return;
++
++    sl = &s_fsnap[s_fsnap_head];
++    sl->pbd = pbd; sl->fix = base + start;
++    sl->at = s_fsnap_pos; sl->bytes = bytes; sl->used = 0;
++    memcpy(s_fsnap_buf + s_fsnap_pos, mem + base + start, bytes);
++    s_fsnap_pos += (bytes + 3u) & ~3u;
++    s_fsnap_head = (s_fsnap_head + 1u) % FIX_SNAP_SLOTS;
++}
++
++/* Apply the oldest unused capture for this pushbuffer, if there is one.
++ * Returns the number of entries written, or -1 when nothing was captured and
++ * the caller should fall back to reading the arena as it stands. */
++static int fix_snap_apply(uint32_t pbd, uint32_t fix, uint32_t pb_len)
++{
++    uint32_t i;
++    for (i = s_fsnap_tail; i != s_fsnap_head; i = (i + 1u) % FIX_SNAP_SLOTS) {
++        FixSnap *sl = &s_fsnap[i];
++        const uint32_t *fp;
++        uint32_t at = 0, guard = 0;
++        int n = 0;
++        if (sl->used || sl->pbd != pbd || sl->fix != fix)
++            continue;
++        sl->used = 1;
++        while (at + 8 <= sl->bytes && guard++ < 4096u) {
++            uint32_t size, off;
++            fp = (const uint32_t *)(s_fsnap_buf + sl->at + at);
++            size = fp[0]; off = fp[1];
++            if (size == 0xFFFFFFFFu)
++                break;
++            if (!size || size > 0x4000u || (size & 3u) || (off & 3u)
++                    || off >= pb_len || size > pb_len - off
++                    || at + 8 + size > sl->bytes)
++                break;
++            memcpy((uint8_t *)xbox_GetMemoryOffset() + pbd + off, fp + 2, size);
++            at += 8 + size;
++            n++;
++        }
++        while (s_fsnap_tail != s_fsnap_head && s_fsnap[s_fsnap_tail].used)
++            s_fsnap_tail = (s_fsnap_tail + 1u) % FIX_SNAP_SLOTS;
++        s_fsnap_taken++;
++        return n;
++    }
++    s_fsnap_missed++;
++    return -1;
 +}
 +
  void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
@@ -3655,9 +3833,14 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
 +                uint32_t w0 = *(volatile uint32_t *)(mem + (0x80000000u | rec));
 +                uint32_t fix = *(volatile uint32_t *)(mem + (0x80000000u | rec) + 12);
 +                uint32_t pbd = *(volatile uint32_t *)(mem + (0x80000000u | rec) + 16);
-+                if ((w0 & 0x20000000u) && !s_fix_at_submit
++                if ((w0 & 0x20000000u)
 +                        && fix >= 0x10000u && fix < 0xF4000000u && !(fix & 3u)
-+                        && pbd >= 0x10000u && !(pbd & 3u) && tail >= pbd) {
++                        && pbd >= 0x10000u && !(pbd & 3u) && tail >= pbd
++                        && fix_snap_apply(pbd, fix, tail + 4u - pbd) < 0) {
++                    /* Nothing was captured for this record (too big to keep,
++                     * or dropped while the walk was behind): read the arena as
++                     * it stands, which is what this executor did before
++                     * captures existed. Stale values beat none. */
 +                    const uint32_t *fp = (const uint32_t *)(mem + fix);
 +                    uint32_t pb_len = tail + 4u - pbd, guard = 0;
 +                    uint32_t cov_lo[128], cov_hi[128], ncov = 0, nent = 0;
@@ -3759,7 +3942,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
       * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
       * held 0xFF000000 at times, which put the write outside guest memory). */
-@@ -4266,7 +5374,7 @@
+@@ -4266,7 +5480,7 @@
       * enter it. So for a mirrored fence the latch carries the mirror's fence
       * bits and the marker's address, which is what a GPU that had consumed
       * everything would report. */
@@ -3768,7 +3951,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
  
          if (!r)
-@@ -4387,12 +5495,19 @@
+@@ -4387,12 +5601,19 @@
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -3789,7 +3972,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
              s_gpu.prim = param;
              s_gpu.idx_count = 0;
              s_gpu.inline_count = 0;
-@@ -4456,6 +5571,10 @@
+@@ -4456,6 +5677,10 @@
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
           * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
@@ -3800,7 +3983,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4511,6 +5630,20 @@
+@@ -4511,6 +5736,20 @@
          xbox_Nv2aFrameCounterFlip();
          if (s_backend_present_sync)
              s_backend_present_sync();
@@ -3821,7 +4004,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -4580,6 +5713,11 @@
+@@ -4580,6 +5819,11 @@
           * early. */
          if (nv2a_pb_exec_flip_pacing()) {
              extern int nv2a_pb_scan_in_call(void);
@@ -3833,7 +4016,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
              xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
                                 clock_ok && !nv2a_pb_scan_in_call());
          }
-@@ -4681,6 +5819,8 @@
+@@ -4681,6 +5925,8 @@
          }
          if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
              record_tex_reg(method, param);
@@ -3842,7 +4025,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
                  && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
              /* Resolved here, once, so every consumer -- the rasteriser's
-@@ -4688,8 +5828,9 @@
+@@ -4688,8 +5934,9 @@
               * address. A vertex array offset is a DMA-object offset exactly
               * like a surface offset: physical, and addressable only through
               * the window when it names contiguous memory. */
@@ -3853,7 +4036,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          } else if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
                  && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
              VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
-@@ -4840,7 +5981,8 @@
+@@ -4840,7 +6087,8 @@
              cur = off;
              fprintf(stderr, "  [CHAIN] start 0x%08X\n", cur);
          } else {
@@ -3863,7 +4046,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
                  fprintf(stderr, "  [CHAIN] step %d: 0x%08X is not a guest"
                                  " pointer -- chain ends\n", step, cur);
                  return;
-@@ -4851,7 +5993,8 @@
+@@ -4851,7 +6099,8 @@
          }
          step++;
      }
@@ -3873,13 +4056,15 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
          fprintf(stderr, "  [CHAIN] final value at 0x%08X = 0x%08X\n",
                  cur, *(const uint32_t *)(mem + cur));
      fflush(stderr);
-@@ -4859,6 +6002,25 @@
+@@ -4859,6 +6108,27 @@
  
  void nv2a_pb_exec_report(void)
  {
 +    if (s_run_pb)
-+        fprintf(stderr, "[PB] %u RunPushBuffer jump-backs written, %u fixups applied, %u fixup runs refused, %u set vertex arrays (%u at submission)\n",
-+                s_run_pb, s_run_pb_fix, s_run_pb_badfix, s_fix_vtx, s_fix_eager);
++        fprintf(stderr, "[PB] %u RunPushBuffer jump-backs written, %u fixups applied, %u refused,"
++                " %u set vertex arrays; captures %u applied, %u missing, %u dropped\n",
++                s_run_pb, s_run_pb_fix, s_run_pb_badfix, s_fix_vtx,
++                s_fsnap_taken, s_fsnap_missed, s_fsnap_dropped);
 +    {
 +        static const char *const pn[11] = { "end", "points", "lines", "line-loop",
 +            "line-strip", "tris", "tri-strip", "tri-fan", "quads", "quad-strip", "polygon" };
@@ -3899,7 +4084,7 @@ diff -ruN -x '*.o' -x 'build*' -x .git -x game_files -x '*.orig' -x '*.log' -x o
      peek_addresses();
      peek_chain();
      if (getenv("RECOMP_FIND_NAN")) {
-@@ -4882,6 +6044,21 @@
+@@ -4882,6 +6152,21 @@
              fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
                      (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
                      s_gpu.flips, 10);
