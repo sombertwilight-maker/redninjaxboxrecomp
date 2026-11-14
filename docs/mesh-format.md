@@ -13,6 +13,17 @@ recording: the addresses in it are the build tool's, and every one of the
 
 * Node names: at `0x140`, one every `0xA0` bytes. Node 0 is `base`, then
   `root`, `bb_hanger`, `skin`, the IK helpers, then the skeleton proper.
+* A node record is `0xA0` bytes: the name, then the node's local bind
+  transform, then its inverse bind matrix. Inverting the second gives a
+  bone's bind pose in model space without walking the hierarchy, which is
+  what a mesh converted from outside the game needs to bind against.
+
+  ```
+  +0x00  name, 0x20 bytes
+  +0x20  local bind transform, 4 rows of 4 floats (translation last)
+  +0x60  inverse bind matrix, same shape
+  ```
+
 * Relocation records: `0x110` bytes each, in a table of their own.
   * `+0x00` offset into the pushbuffer that this record patches
   * `+0x04` type (see below)
