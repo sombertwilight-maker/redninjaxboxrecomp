@@ -79,3 +79,32 @@ mad o0.xyz = R12 * R1.x + c[191] ; divide, then offset
 
 Most programs keep the viewport in `c[58]`/`c[59]`; the wire's keeps it in
 `c[190]`/`c[191]`.
+
+## Converting an outside mesh into the player's skin
+
+`tools/costume/` turns a rigged FBX into a drop-in replacement for the player's
+body geometry. The pieces:
+
+- `fbx.py` — binary FBX 7.x reader. Indexes both `OO` and `OP` connections; a
+  reader that only walks `OO` resolves every material and texture to nothing.
+- `model.py` — meshes, triangulated faces, normals, UVs, and skin clusters.
+  Each cluster keeps both of its matrices: `Transform` (geometry space to bone
+  local) and `TransformLink` (bone local to bind world).
+- `game.py` — reads the game's own QMX0 player mesh: nodes, bind pose, the
+  74-byte vertex block at 0x5020, and the triangle list.
+- `bones.py` — maps the game's 29 bones onto the source rig's names. The game's
+  three skirt bones all sit at negative Z, so they are the back flap.
+- `build.py` — the converter.
+
+The one thing worth writing down twice: the game stores skinned positions and
+normals **in bone-local space**, premultiplied by their influence weight, with
+the inverse bind baked in. So a vertex authored in some other tool has to go
+
+    v × Transform × TransformLink × inverse(game_bind)
+
+per influence, where `game_bind` is the local bind matrix of whichever game bone
+that influence was mapped to. Getting this wrong is quiet: the mesh still draws,
+it just folds itself inside out when the skeleton moves. The check that catches
+it is to run the chain backwards — transform each stored influence through the
+game's bind pose and confirm the result is a human standing at the origin with
+its feet at y≈0.
